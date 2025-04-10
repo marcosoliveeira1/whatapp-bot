@@ -189,8 +189,4 @@ LOG_LEVEL=debug npm start
 
 ## License
 
-[License information]
-
-## Contributing
-
-[Contribution guidelines]
+This project is licensed under the MIT License
