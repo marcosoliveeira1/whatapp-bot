@@ -1,0 +1,995 @@
+
+// ./src/config/config.ts
+
+import dotenv from "dotenv";
+import { z } from "zod";
+import { createLogger } from "../utils/logger";
+
+dotenv.config();
+
+const logger = createLogger("Config");
+
+const configSchema = z.object({
+  amqp: z.object({
+    url: z.string().min(1, "AMQP_URL is required"),
+    reconnectAttempts: z.coerce.number().default(10),
+    reconnectDelay: z.coerce.number().default(5000),
+    queues: z.object({
+      outgoing: z.string().min(1, "AMQP_QUEUE_OUTGOING is required"),
+      incoming: z.string().min(1, "AMQP_QUEUE_INCOMING is required"),
+    }),
+  }),
+  logging: z.object({
+    level: z.string().default("info"),
+    prettyPrint: z.boolean().default(process.env.NODE_ENV !== "production"),
+  }),
+  whatsapp: z.object({
+    sessionPath: z.string().default("auth"),
+    reconnectInterval: z.coerce.number().default(30000),
+  }),
+  health: z.object({
+    port: z.coerce.number().default(3000),
+  }),
+});
+
+const parsedConfig = configSchema.safeParse({
+  amqp: {
+    url: process.env.AMQP_URL,
+    reconnectAttempts: process.env.AMQP_RECONNECT_ATTEMPTS ?? 10,
+    reconnectDelay: process.env.AMQP_RECONNECT_DELAY ?? 5000,
+    queues: {
+      outgoing: process.env.AMQP_QUEUE_OUTGOING ?? "messages-received",
+      incoming: process.env.AMQP_QUEUE_INCOMING ?? "messages-sent",
+    },
+  },
+  logging: {
+    level: process.env.LOG_LEVEL,
+    prettyPrint: process.env.NODE_ENV !== "production",
+  },
+  whatsapp: {
+    sessionPath: process.env.WHATSAPP_SESSION_PATH ?? "auth",
+    reconnectInterval: process.env.WHATSAPP_RECONNECT_INTERVAL ?? 30000,
+  },
+  health: {
+    port: process.env.HEALTH_PORT ?? 3000,
+  },
+});
+
+if (!parsedConfig.success) {
+  const flatErrors = parsedConfig.error.flatten().fieldErrors;
+
+  const errorMessages = Object.entries(flatErrors)
+    .map(([field, errors]) => `${field}: ${errors?.join(", ")}`)
+    .join("\n");
+
+  logger.fatal(
+    { errors: errorMessages },
+    "Failed to load configuration"
+  );
+  process.exit(1);
+}
+
+logger.info("Configuration loaded successfully");
+
+export const config = parsedConfig.data;
+
+
+// ./src/app.ts
+
+import { createLogger } from "./utils/logger";
+import { AmqpConsumer } from "./implementations/amqp-consumer";
+import { AmqpPublisher } from "./implementations/amqp-publisher"; // Correct path if needed
+import { BaileysSender } from "./implementations/baileys-sender";
+import { BaileysReceiver } from "./implementations/baileys-receiver";
+import { healthMonitor } from "./utils/health-monitor";
+import { GracefulShutdown } from "./utils/graceful-shutdown";
+import { AmqpConnectionManager } from "./utils/amqp-connection-manager"; // Ensure this is correctly imported and initialized
+import { config } from "./config/config";
+import { WhatsAppConnection } from "./implementations/baileys-client";
+import { QRCodeGenerator } from "./utils/qrcode-generator";
+
+const logger = createLogger("app");
+
+const qrCodeGenerator = new QRCodeGenerator();
+const whatsappConnection = new WhatsAppConnection(qrCodeGenerator);
+const gracefulShutdown = new GracefulShutdown();
+// Custom error subclass for application errors
+class AppError extends Error {
+  constructor(message: string, public readonly cause?: Error) {
+    super(message);
+    this.name = "AppError";
+  }
+}
+
+let amqpConnectionManager: AmqpConnectionManager | null = null;
+
+async function startWhatsAppIntegration() {
+  logger.info("Starting WhatsApp integration service");
+
+  try {
+    const gracefulShutdown = new GracefulShutdown();
+    // Ensure AMQP Manager tries to connect early if needed, though getChannel handles lazy connection.
+    // await amqpConnectionManager.connect(); // Optional: Force initial connection attempt
+    amqpConnectionManager = new AmqpConnectionManager();
+    // Initialize WhatsApp connection
+    logger.info("Initializing WhatsApp connection");
+    const whatsAppClient = await whatsappConnection.connect(); // This returns the Baileys Socket directly now
+    const baileysClientWrapper = whatsappConnection; // Keep the wrapper for state management if needed
+
+    // Initialize sender and receiver
+    const sender = new BaileysSender(whatsAppClient); // Pass the socket
+    const publisher = new AmqpPublisher(amqpConnectionManager); // No args needed now
+    const receiver = new BaileysReceiver(
+        whatsAppClient, // Pass the socket
+        publisher,
+        config.amqp.queues.incoming
+    );
+
+
+    // Initialize message consumer for outgoing messages
+    logger.info("Initializing message consumer");
+    const consumer = new AmqpConsumer(config.amqp.queues.outgoing, amqpConnectionManager);
+    await consumer.consume(async (data) => {
+        // Basic validation
+        if (!data || typeof data.to !== 'string' || typeof data.message !== 'string') {
+            logger.error({ receivedData: data }, "Invalid message format received from outgoing queue");
+            // Decide how to handle invalid messages (e.g., log, move to DLX)
+            return; // Skip processing this invalid message
+        }
+        // Instead of directly sending, queue the message through rate limiter (if implemented)
+        // For now, direct send:
+        await sender.send(data.to, data.message);
+    });
+
+    // Register health checks
+    healthMonitor.registerService("whatsapp", async () => {
+      // Use the wrapper to check connection state
+      return baileysClientWrapper.getConnectionState();
+    });
+
+    healthMonitor.registerService("amqp", async () => {
+      try {
+        // Getting the channel implicitly checks the connection
+        const channel = await amqpConnectionManager?.getChannel();
+        // Optional: Perform a lightweight check like checking channel status if available
+        return !!channel; // Simple check: if we get a channel, assume connection is ok
+      } catch (error) {
+        logger.warn({ error }, "AMQP health check failed");
+        return false;
+      }
+    });
+
+    // Start health monitoring
+    healthMonitor.start();
+
+    // Register shutdown handlers
+    gracefulShutdown.setAmqpConnectionManager(amqpConnectionManager);
+    gracefulShutdown.registerDefaultHandlers(); // This already includes amqpConnectionManager.close()
+
+     // Add handler for WhatsApp connection if needed
+    gracefulShutdown.registerHandler(async () => {
+        logger.info("Closing WhatsApp connection...");
+        // Baileys doesn't have an explicit close, but ending the process after logout/disconnect is typical
+        // await whatsappConnection.disconnect(); // Add a disconnect method if needed
+        // Or rely on process exit handling the socket closure.
+        const sock = whatsappConnection.getSocket();
+        if (sock) {
+           // sock.logout(); // or sock.end(new Error('Shutdown requested'));
+           // Consider just logging out might be cleaner if possible
+        }
+        logger.info("WhatsApp connection cleanup initiated.");
+    }, "WhatsApp Connection");
+
+
+    logger.info("WhatsApp integration service started successfully");
+
+    return {
+      sender,
+      receiver,
+      consumer,
+      // Expose other components if needed for testing or extension
+    };
+  } catch (error) {
+    const appError = new AppError(
+      "Failed to start WhatsApp integration service",
+      error as Error
+    );
+    logger.error({ error: appError, cause: error }, appError.message); // Log original error too
+    // Ensure AMQP connection is closed on startup failure if it was opened
+    await amqpConnectionManager?.close().catch(e => logger.error({error: e}, "Error closing AMQP connection during startup failure"));
+    throw appError;
+  }
+}
+
+// Application entry point
+(async () => {
+  try {
+    await startWhatsAppIntegration();
+  } catch (error) {
+    // Error is already logged in startWhatsAppIntegration
+    logger.fatal("Service failed to start. Exiting.");
+    process.exit(1);
+  }
+})();
+
+// Export for testing
+export { startWhatsAppIntegration };
+
+// ./src/utils/graceful-shutdown.ts
+
+import { AmqpConnectionManager } from "./amqp-connection-manager";
+import { createLogger } from "./logger";
+
+type ShutdownHandler = () => Promise<void>;
+
+export class GracefulShutdown {
+  private logger = createLogger("GracefulShutdown");
+  private handlers: ShutdownHandler[] = [];
+  private shuttingDown = false;
+  private shutdownTimeout = parseInt(
+    process.env.SHUTDOWN_TIMEOUT_MS || "10000"
+  );
+  private amqpConnectionManager: AmqpConnectionManager | null = null;
+
+  constructor() {
+    // Register for system signals
+    process.on("SIGTERM", this.shutdown.bind(this));
+    process.on("SIGINT", this.shutdown.bind(this));
+    process.on("uncaughtException", (error) => {
+      this.logger.fatal({ error }, "Uncaught exception");
+      this.shutdown(1);
+    });
+    process.on("unhandledRejection", (reason) => {
+      this.logger.fatal({ reason }, "Unhandled promise rejection");
+      this.shutdown(1);
+    });
+  }
+
+  public setAmqpConnectionManager(amqpConnectionManager: AmqpConnectionManager): void {
+    this.amqpConnectionManager = amqpConnectionManager;
+  }
+
+  public registerHandler(handler: ShutdownHandler, name?: string): void {
+    this.handlers.push(handler);
+    this.logger.debug(`Registered shutdown handler${name ? ": " + name : ""}`);
+  }
+
+  public registerDefaultHandlers(): void {
+    // AMQP connection
+    this.registerHandler(async () => {
+      await this?.amqpConnectionManager?.close();
+    }, "AMQP Connection");
+
+    this.logger.info("Registered default shutdown handlers");
+  }
+
+  private async shutdown(exitCode: number = 0): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+
+    this.logger.info("Graceful shutdown initiated");
+
+    // Set a timeout to force exit if shutdown takes too long
+    const forceExitTimeout = setTimeout(() => {
+      this.logger.error(
+        `Shutdown timed out after ${this.shutdownTimeout}ms, forcing exit`
+      );
+      process.exit(exitCode || 1);
+    }, this.shutdownTimeout);
+
+    try {
+      const shutdownPromises = this.handlers.map(async (handler, index) => {
+        try {
+          await handler();
+          this.logger.debug(`Handler ${index + 1} completed`);
+        } catch (error) {
+          this.logger.error(
+            { error, handlerIndex: index },
+            "Error in shutdown handler"
+          );
+        }
+      });
+
+      await Promise.all(shutdownPromises);
+      this.logger.info("All shutdown handlers completed successfully");
+    } catch (error) {
+      this.logger.error({ error }, "Error during shutdown sequence");
+    } finally {
+      clearTimeout(forceExitTimeout);
+      this.logger.info(`Exiting with code ${exitCode}`);
+      process.exit(exitCode);
+    }
+  }
+}
+
+
+// ./src/utils/logger.ts
+
+import pino from "pino";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const logLevel = process.env.LOG_LEVEL || "info";
+
+export const logger = pino({
+  level: logLevel,
+  transport:
+    process.env.LOG_PRETTY === "true"
+      ? { target: "pino-pretty" }
+      : undefined,
+  timestamp: pino.stdTimeFunctions.isoTime,
+});
+
+// Create child loggers for specific components
+export const createLogger = (component: string) => {
+  return logger.child({ component });
+};
+
+
+// ./src/utils/health-monitor.ts
+
+import express, { Request, Response, Application } from "express";
+import { createLogger } from "./logger";
+import { config } from "../config/config";
+
+interface ServiceStatus {
+  service: string;
+  status: "up" | "down";
+  lastChecked: Date;
+  details?: any;
+}
+
+class HealthMonitor {
+  private app: Application = express();
+  private port = config.health.port;
+  private logger = createLogger("HealthMonitor");
+  private serviceStatuses: Map<string, ServiceStatus> = new Map();
+
+  constructor() {
+    this.setupRoutes();
+  }
+
+  private setupRoutes() {
+    this.app.get("/health", (_: Request, res: Response) => {
+      const statuses = Array.from(this.serviceStatuses.values());
+      const allServicesUp = statuses.every((s) => s.status === "up");
+
+      res.status(allServicesUp ? 200 : 503).json({
+        status: allServicesUp ? "healthy" : "unhealthy",
+        timestamp: new Date().toISOString(),
+        services: statuses,
+      });
+    });
+
+    // @ts-ignore
+    this.app.get("/health/:service", (req, res) => {
+      const service = this.serviceStatuses.get(req.params.service);
+
+      if (!service) {
+        return res.status(404).json({
+          error: `Service ${req.params.service} not found`,
+        });
+      }
+
+      res.status(service.status === "up" ? 200 : 503).json(service);
+    });
+  }
+
+  public start() {
+    this.app.listen(this.port, () => {
+      this.logger.info(
+        `Health check endpoint listening at http://localhost:${this.port}/health`
+      );
+    });
+  }
+
+  public registerService(
+    service: string,
+    checkFn: () => Promise<boolean>,
+    interval = 60000
+  ) {
+    // Initial status
+    this.serviceStatuses.set(service, {
+      service,
+      status: "down",
+      lastChecked: new Date(),
+    });
+
+    // Periodic health check
+    const check = async () => {
+      try {
+        const isUp = await checkFn();
+        this.updateStatus(service, isUp);
+      } catch (error) {
+        this.logger.error({ error, service }, "Health check failed");
+        this.updateStatus(service, false, error);
+      }
+    };
+
+    // Run initial check
+    check();
+
+    // Schedule regular checks
+    setInterval(check, interval);
+
+    this.logger.info(
+      `Registered health check for ${service}, checking every ${interval}ms`
+    );
+  }
+
+  private updateStatus(service: string, isUp: boolean, details?: any) {
+    const currentStatus = this.serviceStatuses.get(service);
+    const newStatus = {
+      service,
+      status: isUp ? ("up" as const) : ("down" as const),
+      lastChecked: new Date(),
+      details,
+    };
+
+    this.serviceStatuses.set(service, newStatus);
+
+    // Log only when status changes
+    if (!currentStatus || currentStatus.status !== newStatus.status) {
+      if (isUp) {
+        this.logger.info({ service }, `Service ${service} is up`);
+      } else {
+        this.logger.warn({ service, details }, `Service ${service} is down`);
+      }
+    }
+  }
+}
+
+export const healthMonitor = new HealthMonitor();
+
+
+// ./src/utils/amqp-connection-manager.ts
+
+import client, { Channel, ChannelModel } from "amqplib";
+import { createLogger } from './logger';
+import { config } from '../config/config';
+
+export class AmqpConnectionManager {
+  private connection: ChannelModel | null = null;
+  private channel: Channel | null = null;
+  private logger = createLogger('AmqpConnectionManager');
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = config.amqp.reconnectAttempts;
+  private reconnectDelay = config.amqp.reconnectDelay;
+
+  async getChannel(): Promise<Channel> {
+    if (!this.connection || !this.channel) {
+      await this.connect();
+    }
+    return this.channel!;
+  }
+
+  async connect(): Promise<void> {
+    try {
+      this.logger.info('Connecting to AMQP broker');
+      this.connection = await client.connect(config.amqp.url);
+
+      if(!this.connection) {
+        throw new Error('Failed to connect to AMQP broker');
+      }
+      
+      this.connection.on('error', (err) => {
+        this.logger.error({ err }, 'AMQP connection error');
+        this.reconnect();
+      });
+      
+      this.connection.on('close', () => {
+        this.logger.warn('AMQP connection closed');
+        this.reconnect();
+      });
+
+      this.channel = await this.connection.createChannel();
+      this.logger.info('Successfully connected to AMQP broker');
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to connect to AMQP broker');
+      this.reconnect();
+    }
+  }
+
+  private reconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+    
+    this.channel = null;
+    this.connection = null;
+    
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.logger.error(`Maximum reconnection attempts (${this.maxReconnectAttempts}) reached`);
+      process.exit(1);
+      return;
+    }
+    
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
+    
+    this.logger.info(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    
+    this.reconnectTimer = setTimeout(() => {
+      this.connect().catch((err) => {
+        this.logger.error({ err }, 'Reconnection attempt failed');
+      });
+    }, delay);
+  }
+
+  async close(): Promise<void> {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+    
+    try {
+      if (this.channel) {
+        await this.channel.close();
+      }
+      if (this.connection) {
+        await this.connection.close();
+      }
+      this.logger.info('AMQP connection closed gracefully');
+    } catch (error) {
+      this.logger.error({ error }, 'Error closing AMQP connection');
+    } finally {
+      this.channel = null;
+      this.connection = null;
+    }
+  }
+}
+
+// ./src/utils/qrcode-generator.ts
+
+import * as qrcode from "qrcode";
+
+export class QRCodeGenerator implements IQRCodeGenerator {
+  private readonly qrCode: typeof qrcode;
+  constructor() {
+    this.qrCode = qrcode;
+  }
+  async generateQRCode(data: string) {
+    return await this.qrCode.toString(data, { type: "terminal" });
+  }
+}
+export interface IQRCodeGenerator {
+  generateQRCode: (data: string) => Promise<string>;
+}
+
+
+// ./src/implementations/baileys-client.ts
+
+import {
+  makeWASocket,
+  WASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  ConnectionState,
+} from "baileys";
+import { Boom } from "@hapi/boom";
+import { createLogger } from "../utils/logger";
+import { config } from "../config/config";
+import { IQRCodeGenerator } from "../utils/qrcode-generator";
+
+const logger = createLogger("WhatsAppConnection");
+
+export class WhatsAppConnection {
+  private sock: WASocket | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private connectionState: Partial<ConnectionState> = {};
+  private isConnected = false;
+
+  constructor(private qrCodeGenerator: IQRCodeGenerator) {}
+
+  async connect(): Promise<WASocket> {
+    try {
+      logger.info("Connecting to WhatsApp");
+
+      const { state, saveCreds } = await useMultiFileAuthState(
+        config.whatsapp.sessionPath
+      );
+
+      this.sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        logger,
+      });
+
+      // Save credentials on update
+      this.sock.ev.on("creds.update", saveCreds);
+
+      // Handle connection updates
+      this.sock.ev.on("connection.update", (update) => {
+        this.handleConnectionUpdate(update);
+      });
+
+      return this.sock;
+    } catch (error) {
+      logger.error({ error, message: (error as Error).message }, "Failed to connect to WhatsApp");
+      this.scheduleReconnect();
+      throw error;
+    }
+  }
+
+  private async handleConnectionUpdate(update: Partial<ConnectionState>) {
+    const { connection, lastDisconnect, qr } = update;
+    this.connectionState = { ...this.connectionState, ...update };
+    
+    if (qr) {
+      logger.info("QR code generated, please scan with your phone");
+      logger.info(await this.qrCodeGenerator.generateQRCode(qr));
+    }
+
+    if (connection === "close") {
+      const shouldReconnect =
+        (lastDisconnect?.error as Boom)?.output?.statusCode !==
+        DisconnectReason.loggedOut;
+
+      if (shouldReconnect) {
+        logger.warn("Connection closed, attempting to reconnect");
+        this.scheduleReconnect();
+      } else {
+        logger.error(
+          "Connection closed due to logout, manual reconnection required"
+        );
+        this.isConnected = false;
+      }
+    } else if (connection === "open") {
+      logger.info("Connected to WhatsApp");
+      this.isConnected = true;
+      this.reconnectAttempts = 0;
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      logger.error(
+        `Maximum reconnection attempts (${this.maxReconnectAttempts}) reached`
+      );
+      process.exit(1);
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const delay =
+      config.whatsapp.reconnectInterval *
+      Math.pow(1.5, this.reconnectAttempts - 1);
+
+    logger.info(
+      `Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`
+    );
+
+    this.reconnectTimer = setTimeout(() => {
+      this.connect().catch((err) => {
+        logger.error({ err }, "Reconnection attempt failed");
+      });
+    }, delay);
+  }
+
+  public getConnectionState(): boolean {
+    return this.isConnected;
+  }
+
+  public getSocket(): WASocket {
+    if (!this.sock) {
+      throw new Error("WhatsApp connection not initialized");
+    }
+    return this.sock;
+  }
+}
+
+// ./src/implementations/baileys-receiver.ts
+
+import { IMessagePublisher } from '../interfaces/IMessagePublisher';
+// import { BaileysClient } from './baileys-client'; // Change this import
+import type { WASocket, WAMessage, proto } from 'baileys'; // Import Baileys types directly
+import { createLogger } from '../utils/logger';
+import { jidNormalizedUser } from 'baileys'; // Helper function
+
+export class BaileysReceiver {
+  private logger = createLogger('BaileysReceiver');
+
+  constructor(
+    private sock: WASocket, // Accept the socket directly
+    private publisher: IMessagePublisher,
+    private incomingQueueName: string // Add queue name parameter
+  ) {
+    this.logger.info('Initializing BaileysReceiver');
+    this.init();
+  }
+
+  private init() {
+    // Use sock.ev directly
+    this.sock.ev.on('messages.upsert', async (m) => {
+      // Process only new messages, not notifications, and not from self
+      if (m.type !== 'notify') return;
+
+      for (const msg of m.messages) {
+         this.handleMessage(msg).catch(err => {
+            this.logger.error({ err, messageId: msg.key.id }, "Error handling incoming message");
+         });
+      }
+    });
+
+    this.logger.info('BaileysReceiver initialized and listening for messages');
+  }
+
+  private async handleMessage(message: WAMessage): Promise<void> {
+      // Ignore messages without content or from self (check key.fromMe)
+      if (!message.message || message.key.fromMe) {
+        this.logger.trace({ msgId: message.key.id, fromMe: message.key.fromMe }, 'Ignoring message (no content or from self)');
+        return;
+      }
+
+      // Extract sender JID and normalize it (remove server/device info)
+      const senderJid = message.key.remoteJid;
+      if (!senderJid) {
+          this.logger.warn({ msgId: message.key.id }, 'Ignoring message without sender JID');
+          return;
+      }
+      const from = jidNormalizedUser(senderJid); // Gets number@s.whatsapp.net
+
+      // Extract message content (simplistic, handles only basic text)
+      // A real implementation needs to handle various types (image, video, location, etc.)
+      const text = message.message.conversation || message.message.extendedTextMessage?.text || '';
+      if (!text) {
+          this.logger.debug({ msgId: message.key.id, from }, 'Ignoring message without text content');
+          return; // Ignore messages without simple text for now
+      }
+
+      // Get timestamp (use Long.toNumber if available, otherwise fallback)
+       const timestamp = typeof message.messageTimestamp === 'number'
+            ? message.messageTimestamp * 1000 // If it's already a number (seconds), convert to ms
+            : typeof message.messageTimestamp === 'object' && message.messageTimestamp !== null && typeof message.messageTimestamp.toNumber === 'function'
+            ? message.messageTimestamp.toNumber() * 1000 // If it's a Long object
+            : Date.now(); // Fallback
+
+
+      this.logger.info({ from, messageId: message.key.id, }, 'Received WhatsApp message');
+      this.logger.debug({ from, text, timestamp }, 'Processing incoming message');
+
+      try {
+        // Publish to the specified incoming queue
+        await this.publisher.publish(this.incomingQueueName, {
+          from: from, // Use normalized JID
+          message: text,
+          timestamp: timestamp, // Use ms timestamp
+          originalMessageId: message.key.id // Include original ID for tracing
+        });
+
+        this.logger.debug({ from, queue: this.incomingQueueName }, 'Message published to queue');
+      } catch (error) {
+        this.logger.error({ error, from, messageId: message.key.id }, 'Error publishing received message to queue');
+        // Decide if you need to re-throw or handle this (e.g., retry)
+      }
+  }
+}
+
+// ./src/implementations/baileys-sender.ts
+
+import { IMessageSender } from '../interfaces/IMessageSender';
+// import { BaileysClient } from './baileys-client'; // Change this import
+import type { WASocket } from 'baileys'; // Import Baileys types directly
+import { createLogger } from '../utils/logger';
+import { jidNormalizedUser } from 'baileys'; // Import helper
+
+export class BaileysSender implements IMessageSender {
+  private logger = createLogger('BaileysSender');
+
+  constructor(private sock: WASocket) { // Accept the socket directly
+    this.logger.info('BaileysSender initialized');
+  }
+
+  async send(to: string, message: string): Promise<void> {
+    try {
+      // Ensure the 'to' JID is correctly formatted (e.g., ends with @s.whatsapp.net)
+      // Baileys often handles adding @s.whatsapp.net automatically if just the number is provided,
+      // but being explicit can be safer.
+      let recipientJid = to;
+      if (!recipientJid.includes('@')) {
+          recipientJid = `${to}@s.whatsapp.net`;
+      }
+      // You might want to normalize it just in case
+      recipientJid = jidNormalizedUser(recipientJid);
+
+      this.logger.info({ to: recipientJid }, 'Sending WhatsApp message');
+      this.logger.debug({ to: recipientJid, message }, 'Message details');
+
+      const result = await this.sock.sendMessage(recipientJid, { text: message });
+
+      this.logger.info({
+        to: recipientJid,
+        messageId: result?.key?.id
+      }, 'WhatsApp message sent successfully');
+
+    } catch (error: any) {
+      // Log specific Baileys errors if possible
+      const errorMessage = error?.message || 'Unknown error';
+      const errorDetails = error?.data || error; // Include additional data if available from Boom errors etc.
+      this.logger.error({ error: errorMessage, details: errorDetails, to }, 'Failed to send WhatsApp message');
+      throw error; // Re-throw the original error
+    }
+  }
+}
+
+// ./src/implementations/amqp-publisher.ts
+
+import { IMessagePublisher } from '../interfaces/IMessagePublisher';
+import { AmqpConnectionManager } from '../utils/amqp-connection-manager';
+import { createLogger } from '../utils/logger';
+const logger = createLogger('AmqpPublisher');
+
+export class AmqpPublisher implements IMessagePublisher {
+  constructor(private amqpConnectionManager: AmqpConnectionManager) {}
+
+  async publish(queueName: string, payload: any): Promise<void> {
+    let channel;
+    try {
+      logger.debug({ queue: queueName }, `Attempting to publish message to queue`);
+      channel = await this.amqpConnectionManager.getChannel();
+
+      await channel.assertQueue(queueName, { durable: true });
+
+      const success = channel.sendToQueue(
+        queueName,
+        Buffer.from(JSON.stringify(payload)),
+        { persistent: true }
+      );
+
+      if (success) {
+        logger.debug({ queue: queueName, payload }, 'Message sent to queue successfully');
+      } else {
+        logger.warn({ queue: queueName }, 'Failed to send message to queue (possibly backpressure)');
+      }
+
+    } catch (error) {
+      logger.error({ error, queue: queueName, payload }, 'Error publishing message to AMQP queue');
+      throw error;
+    }
+  }
+}
+
+// ./src/implementations/amqp-consumer.ts
+
+import { Channel, ConsumeMessage } from 'amqplib';
+import { IMessageConsumer } from '../interfaces/IMessageConsumer';
+import { createLogger } from '../utils/logger';
+import { AmqpConnectionManager } from '../utils/amqp-connection-manager'; // Import the manager
+
+export class AmqpConsumer implements IMessageConsumer {
+  private logger = createLogger('AmqpConsumer');
+  private channel: Channel | null = null; // Store the channel to manage consumption cancellation if needed
+
+  constructor(private queue: string, private amqpConnectionManager: AmqpConnectionManager) {
+    this.logger.debug(`Creating consumer for queue: ${this.queue}`);
+  }
+
+  async consume(callback: (data: any) => Promise<void>): Promise<void> {
+    try {
+      this.logger.info(`Attempting to get AMQP channel for queue: ${this.queue}`);
+      this.channel = await this.amqpConnectionManager.getChannel(); // Get the shared channel
+
+      // No need for conn.on('error', ...) here - manager handles it
+
+      await this.channel.assertQueue(this.queue, { durable: true });
+      this.logger.info(`Consuming messages from queue: ${this.queue}`);
+
+      // Set prefetch count for better load balancing if multiple consumers exist
+      this.channel.prefetch(1);
+
+      this.channel.consume(this.queue, async (msg: ConsumeMessage | null) => {
+        if (!msg) {
+          this.logger.warn(`Consumer for queue ${this.queue} received null message (channel closed?)`);
+          // The manager should attempt to reconnect, but consumption might need explicit restart
+          // depending on how amqplib handles channel closure vs connection closure.
+          // For now, we just log. A more robust implementation might try to re-initiate consume.
+          return;
+        }
+
+        let data: any;
+        try {
+          data = JSON.parse(msg.content.toString());
+          this.logger.debug({ data, msgId: msg.properties.messageId }, `Received message from queue: ${this.queue}`);
+          await callback(data);
+          this.channel!.ack(msg); // Acknowledge after successful processing
+          this.logger.debug({ msgId: msg.properties.messageId }, 'Message processed and acknowledged successfully');
+        } catch (error) {
+          this.logger.error({ error, msg: msg.content.toString(), msgId: msg.properties.messageId }, 'Error processing message');
+          // Negative acknowledge, message will be requeued (or sent to DLX if configured)
+          // Set requeue to false to avoid infinite loops for messages that always fail
+          this.channel!.nack(msg, false, false);
+        }
+      }, {
+        // noAck: false is the default and recommended for reliability
+      });
+
+      // Handle channel errors specifically if needed (e.g., channel closed unexpectedly)
+      this.channel.on('error', (err) => {
+          this.logger.error({ err, queue: this.queue }, 'AMQP channel error during consumption');
+          // Consumption might stop here. The AmqpConnectionManager will handle connection errors,
+          // but channel-specific errors might need handling or could indicate a bigger issue.
+      });
+      this.channel.on('close', () => {
+          this.logger.warn({ queue: this.queue }, 'AMQP channel closed during consumption.');
+          // Attempt to restart consumption might be needed here if the connection is still alive.
+          // However, if the connection also closed, the manager's reconnect logic should trigger.
+      });
+
+
+    } catch (error) {
+      this.logger.error({ error, queue: this.queue }, `Failed to setup consumer for queue: ${this.queue}`);
+      // Propagate the error to indicate setup failure
+      throw error;
+      // Consider adding retry logic here or relying on the application startup process to retry
+    }
+  }
+
+  // Optional: Add a method to gracefully stop consuming if needed
+  async stop(): Promise<void> {
+    if (this.channel) {
+        try {
+            this.logger.info(`Stopping consumer for queue: ${this.queue}`);
+            // TODO: Need a consumer tag to properly cancel.
+            // The basic `consume` example doesn't easily provide this back.
+            // A more robust implementation might store the tag returned by `channel.consume`.
+            // For now, we can try closing the channel used by this consumer instance,
+            // but this isn't ideal if the channel is truly shared without careful management.
+            // await this.channel.close(); // Closing the shared channel might affect others! Avoid if possible.
+            this.logger.warn(`Stopping consumer for ${this.queue} - graceful cancellation not fully implemented without consumer tags.`);
+
+        } catch (error) {
+            this.logger.error({ error, queue: this.queue }, `Error stopping consumer`);
+        } finally {
+            this.channel = null;
+        }
+    }
+  }
+}
+
+// ./src/usecases/handleReceivedMessage.ts
+
+import { IMessagePublisher } from '../interfaces/IMessagePublisher';
+
+export async function handleReceivedMessage(publisher: IMessagePublisher, data: { from: string, message: string, timestamp: number }) {
+  await publisher.publish('message_received', data);
+}
+
+
+// ./src/usecases/handleIncomingMessage.ts
+
+import { IMessageSender } from '../interfaces/IMessageSender';
+
+export async function handleIncomingMessage(sender: IMessageSender, data: { to: string, message: string }) {
+  await sender.send(data.to, data.message);
+}
+
+
+// ./src/interfaces/IMessageSender.ts
+
+export interface IMessageSender {
+  send(to: string, message: string): Promise<void>;
+}
+
+
+// ./src/interfaces/IMessageConsumer.ts
+
+export interface IMessageConsumer {
+  consume(callback: (data: any) => Promise<void>): Promise<void>;
+}
+
+
+// ./src/interfaces/IMessagePublisher.ts
+
+export interface IMessagePublisher {
+  publish(event: string, payload: any): Promise<void>;
+}
+
+
