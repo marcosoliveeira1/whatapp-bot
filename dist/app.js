@@ -3,18 +3,19 @@ import pino from "pino";
 import dotenv from "dotenv";
 dotenv.config();
 var logLevel = process.env.LOG_LEVEL || "info";
+console.log("Log level set to:", logLevel);
 var logger = pino({
   level: logLevel,
   transport: process.env.LOG_PRETTY === "true" ? { target: "pino-pretty" } : void 0,
   timestamp: pino.stdTimeFunctions.isoTime
 });
 var createLogger = (component) => {
+  console.log("Creating logger for component:", component);
   return logger.child({ component });
 };
 
 // src/implementations/amqp-consumer.ts
 var AmqpConsumer = class {
-  // Store the channel to manage consumption cancellation if needed
   constructor(queue, amqpConnectionManager2) {
     this.queue = queue;
     this.amqpConnectionManager = amqpConnectionManager2;
@@ -24,49 +25,81 @@ var AmqpConsumer = class {
   channel = null;
   async consume(callback) {
     try {
-      this.logger.info(`Attempting to get AMQP channel for queue: ${this.queue}`);
+      this.logger.info(
+        `Attempting to get AMQP channel for queue: ${this.queue}`
+      );
       this.channel = await this.amqpConnectionManager.getChannel();
       await this.channel.assertQueue(this.queue, { durable: true });
       this.logger.info(`Consuming messages from queue: ${this.queue}`);
       this.channel.prefetch(1);
-      this.channel.consume(this.queue, async (msg) => {
-        if (!msg) {
-          this.logger.warn(`Consumer for queue ${this.queue} received null message (channel closed?)`);
-          return;
-        }
-        let data;
-        try {
-          data = JSON.parse(msg.content.toString());
-          this.logger.debug({ data, msgId: msg.properties.messageId }, `Received message from queue: ${this.queue}`);
-          await callback(data);
-          this.channel.ack(msg);
-          this.logger.debug({ msgId: msg.properties.messageId }, "Message processed and acknowledged successfully");
-        } catch (error) {
-          this.logger.error({ error, msg: msg.content.toString(), msgId: msg.properties.messageId }, "Error processing message");
-          this.channel.nack(msg, false, false);
-        }
-      }, {
-        // noAck: false is the default and recommended for reliability
-      });
+      this.channel.consume(
+        this.queue,
+        async (msg) => {
+          if (!msg) {
+            this.logger.warn(
+              `Consumer for queue ${this.queue} received null message (channel closed?)`
+            );
+            return;
+          }
+          let data;
+          try {
+            data = JSON.parse(msg.content.toString());
+            this.logger.debug(
+              { data, msgId: msg.properties.messageId },
+              `Received message from queue: ${this.queue}`
+            );
+            await callback(data);
+            this.channel.ack(msg);
+            this.logger.debug(
+              { msgId: msg.properties.messageId },
+              "Message processed and acknowledged successfully"
+            );
+          } catch (error) {
+            this.logger.error(
+              {
+                error,
+                msg: msg.content.toString(),
+                msgId: msg.properties.messageId
+              },
+              "Error processing message"
+            );
+            this.channel.nack(msg, false, false);
+          }
+        },
+        {}
+      );
       this.channel.on("error", (err) => {
-        this.logger.error({ err, queue: this.queue }, "AMQP channel error during consumption");
+        this.logger.error(
+          { err, queue: this.queue },
+          "AMQP channel error during consumption"
+        );
       });
       this.channel.on("close", () => {
-        this.logger.warn({ queue: this.queue }, "AMQP channel closed during consumption.");
+        this.logger.warn(
+          { queue: this.queue },
+          "AMQP channel closed during consumption."
+        );
       });
     } catch (error) {
-      this.logger.error({ error, queue: this.queue }, `Failed to setup consumer for queue: ${this.queue}`);
+      this.logger.error(
+        { error, queue: this.queue },
+        `Failed to setup consumer for queue: ${this.queue}`
+      );
       throw error;
     }
   }
-  // Optional: Add a method to gracefully stop consuming if needed
   async stop() {
     if (this.channel) {
       try {
         this.logger.info(`Stopping consumer for queue: ${this.queue}`);
-        this.logger.warn(`Stopping consumer for ${this.queue} - graceful cancellation not fully implemented without consumer tags.`);
+        this.logger.warn(
+          `Stopping consumer for ${this.queue} - graceful cancellation not fully implemented without consumer tags.`
+        );
       } catch (error) {
-        this.logger.error({ error, queue: this.queue }, `Error stopping consumer`);
+        this.logger.error(
+          { error, queue: this.queue },
+          `Error stopping consumer`
+        );
       } finally {
         this.channel = null;
       }
@@ -83,7 +116,10 @@ var AmqpPublisher = class {
   async publish(queueName, payload) {
     let channel;
     try {
-      logger2.debug({ queue: queueName }, `Attempting to publish message to queue`);
+      logger2.debug(
+        { queue: queueName },
+        `Attempting to publish message to queue`
+      );
       channel = await this.amqpConnectionManager.getChannel();
       await channel.assertQueue(queueName, { durable: true });
       const success = channel.sendToQueue(
@@ -92,12 +128,21 @@ var AmqpPublisher = class {
         { persistent: true }
       );
       if (success) {
-        logger2.debug({ queue: queueName, payload }, "Message sent to queue successfully");
+        logger2.debug(
+          { queue: queueName, payload },
+          "Message sent to queue successfully"
+        );
       } else {
-        logger2.warn({ queue: queueName }, "Failed to send message to queue (possibly backpressure)");
+        logger2.warn(
+          { queue: queueName },
+          "Failed to send message to queue (possibly backpressure)"
+        );
       }
     } catch (error) {
-      logger2.error({ error, queue: queueName, payload }, "Error publishing message to AMQP queue");
+      logger2.error(
+        { error, queue: queueName, payload },
+        "Error publishing message to AMQP queue"
+      );
       throw error;
     }
   }
@@ -120,15 +165,23 @@ var BaileysSender = class {
       recipientJid = jidNormalizedUser(recipientJid);
       this.logger.info({ to: recipientJid }, "Sending WhatsApp message");
       this.logger.debug({ to: recipientJid, message }, "Message details");
-      const result = await this.sock.sendMessage(recipientJid, { text: message });
-      this.logger.info({
-        to: recipientJid,
-        messageId: result?.key?.id
-      }, "WhatsApp message sent successfully");
+      const result = await this.sock.sendMessage(recipientJid, {
+        text: message
+      });
+      this.logger.info(
+        {
+          to: recipientJid,
+          messageId: result?.key?.id
+        },
+        "WhatsApp message sent successfully"
+      );
     } catch (error) {
       const errorMessage = error?.message || "Unknown error";
       const errorDetails = error?.data || error;
-      this.logger.error({ error: errorMessage, details: errorDetails, to }, "Failed to send WhatsApp message");
+      this.logger.error(
+        { error: errorMessage, details: errorDetails, to },
+        "Failed to send WhatsApp message"
+      );
       throw error;
     }
   }
@@ -150,7 +203,10 @@ var BaileysReceiver = class {
       if (m.type !== "notify") return;
       for (const msg of m.messages) {
         this.handleMessage(msg).catch((err) => {
-          this.logger.error({ err, messageId: msg.key.id }, "Error handling incoming message");
+          this.logger.error(
+            { err, messageId: msg.key.id },
+            "Error handling incoming message"
+          );
         });
       }
     });
@@ -158,36 +214,51 @@ var BaileysReceiver = class {
   }
   async handleMessage(message) {
     if (!message.message || message.key.fromMe) {
-      this.logger.trace({ msgId: message.key.id, fromMe: message.key.fromMe }, "Ignoring message (no content or from self)");
+      this.logger.trace(
+        { msgId: message.key.id, fromMe: message.key.fromMe },
+        "Ignoring message (no content or from self)"
+      );
       return;
     }
     const senderJid = message.key.remoteJid;
     if (!senderJid) {
-      this.logger.warn({ msgId: message.key.id }, "Ignoring message without sender JID");
+      this.logger.warn(
+        { msgId: message.key.id },
+        "Ignoring message without sender JID"
+      );
       return;
     }
     const from = jidNormalizedUser2(senderJid);
     const text = message.message.conversation || message.message.extendedTextMessage?.text || "";
     if (!text) {
-      this.logger.debug({ msgId: message.key.id, from }, "Ignoring message without text content");
+      this.logger.debug(
+        { msgId: message.key.id, from },
+        "Ignoring message without text content"
+      );
       return;
     }
     const timestamp = typeof message.messageTimestamp === "number" ? message.messageTimestamp * 1e3 : typeof message.messageTimestamp === "object" && message.messageTimestamp !== null && typeof message.messageTimestamp.toNumber === "function" ? message.messageTimestamp.toNumber() * 1e3 : Date.now();
-    this.logger.info({ from, messageId: message.key.id }, "Received WhatsApp message");
+    this.logger.info(
+      { from, messageId: message.key.id },
+      "Received WhatsApp message"
+    );
     this.logger.debug({ from, text, timestamp }, "Processing incoming message");
     try {
       await this.publisher.publish(this.incomingQueueName, {
         from,
-        // Use normalized JID
         message: text,
         timestamp,
-        // Use ms timestamp
         originalMessageId: message.key.id
-        // Include original ID for tracing
       });
-      this.logger.debug({ from, queue: this.incomingQueueName }, "Message published to queue");
+      this.logger.debug(
+        { from, queue: this.incomingQueueName },
+        "Message published to queue"
+      );
     } catch (error) {
-      this.logger.error({ error, from, messageId: message.key.id }, "Error publishing received message to queue");
+      this.logger.error(
+        { error, from, messageId: message.key.id },
+        "Error publishing received message to queue"
+      );
     }
   }
 };
@@ -195,7 +266,7 @@ var BaileysReceiver = class {
 // src/utils/health-monitor.ts
 import express from "express";
 
-// src/config/index.ts
+// src/config/config.ts
 import dotenv2 from "dotenv";
 import { z } from "zod";
 dotenv2.config();
@@ -447,13 +518,17 @@ var AmqpConnectionManager = class {
     this.channel = null;
     this.connection = null;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.error(`Maximum reconnection attempts (${this.maxReconnectAttempts}) reached`);
+      this.logger.error(
+        `Maximum reconnection attempts (${this.maxReconnectAttempts}) reached`
+      );
       process.exit(1);
       return;
     }
     this.reconnectAttempts++;
     const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
-    this.logger.info(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    this.logger.info(
+      `Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`
+    );
     this.reconnectTimer = setTimeout(() => {
       this.connect().catch((err) => {
         this.logger.error({ err }, "Reconnection attempt failed");
@@ -487,8 +562,8 @@ import {
   useMultiFileAuthState,
   DisconnectReason
 } from "baileys";
-var logger4 = createLogger("WhatsAppConnection");
-var WhatsAppConnection = class {
+var logger4 = createLogger("BaileysClient");
+var BaileysClient = class {
   constructor(qrCodeGenerator2) {
     this.qrCodeGenerator = qrCodeGenerator2;
   }
@@ -585,14 +660,14 @@ var QRCodeGenerator = class {
     this.qrCode = qrcode;
   }
   async generateQRCode(data) {
-    return await this.qrCode.toString(data);
+    return await this.qrCode.toString(data, { type: "terminal" });
   }
 };
 
 // src/app.ts
 var logger5 = createLogger("app");
 var qrCodeGenerator = new QRCodeGenerator();
-var whatsappConnection = new WhatsAppConnection(qrCodeGenerator);
+var baileysConnection = new BaileysClient(qrCodeGenerator);
 var gracefulShutdown = new GracefulShutdown();
 var AppError = class extends Error {
   constructor(message, cause) {
@@ -608,21 +683,26 @@ async function startWhatsAppIntegration() {
     const gracefulShutdown2 = new GracefulShutdown();
     amqpConnectionManager = new AmqpConnectionManager();
     logger5.info("Initializing WhatsApp connection");
-    const whatsAppClient = await whatsappConnection.connect();
-    const baileysClientWrapper = whatsappConnection;
+    const whatsAppClient = await baileysConnection.connect();
+    const baileysClientWrapper = baileysConnection;
     const sender = new BaileysSender(whatsAppClient);
     const publisher = new AmqpPublisher(amqpConnectionManager);
     const receiver = new BaileysReceiver(
       whatsAppClient,
-      // Pass the socket
       publisher,
       config.amqp.queues.incoming
     );
     logger5.info("Initializing message consumer");
-    const consumer = new AmqpConsumer(config.amqp.queues.outgoing, amqpConnectionManager);
+    const consumer = new AmqpConsumer(
+      config.amqp.queues.outgoing,
+      amqpConnectionManager
+    );
     await consumer.consume(async (data) => {
       if (!data || typeof data.to !== "string" || typeof data.message !== "string") {
-        logger5.error({ receivedData: data }, "Invalid message format received from outgoing queue");
+        logger5.error(
+          { receivedData: data },
+          "Invalid message format received from outgoing queue"
+        );
         return;
       }
       await sender.send(data.to, data.message);
@@ -644,7 +724,7 @@ async function startWhatsAppIntegration() {
     gracefulShutdown2.registerDefaultHandlers();
     gracefulShutdown2.registerHandler(async () => {
       logger5.info("Closing WhatsApp connection...");
-      const sock = whatsappConnection.getSocket();
+      const sock = baileysConnection.getSocket();
       if (sock) {
       }
       logger5.info("WhatsApp connection cleanup initiated.");
@@ -654,7 +734,6 @@ async function startWhatsAppIntegration() {
       sender,
       receiver,
       consumer
-      // Expose other components if needed for testing or extension
     };
   } catch (error) {
     const appError = new AppError(
@@ -662,7 +741,12 @@ async function startWhatsAppIntegration() {
       error
     );
     logger5.error({ error: appError, cause: error }, appError.message);
-    await amqpConnectionManager?.close().catch((e) => logger5.error({ error: e }, "Error closing AMQP connection during startup failure"));
+    await amqpConnectionManager?.close().catch(
+      (e) => logger5.error(
+        { error: e },
+        "Error closing AMQP connection during startup failure"
+      )
+    );
     throw appError;
   }
 }

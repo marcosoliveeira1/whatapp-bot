@@ -7,3 +7,5 @@ package-lock.json
 .env
 auth
 auth2
+
+dist
